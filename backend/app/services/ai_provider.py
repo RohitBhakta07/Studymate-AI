@@ -8,6 +8,8 @@ The API key is read from centralized config only. It is never logged, never retu
 and never interpolated into user-facing messages.
 """
 
+import time
+
 from app.core.config import settings
 from app.core.errors import AppError
 
@@ -28,8 +30,9 @@ def _client():
 
 def _code_of(exc) -> int | None:
     try:
-        return int(getattr(exc, "code"))
-    except (TypeError, ValueError):
+        val = getattr(exc, "code", None)
+        return int(val) if val is not None else None
+    except (TypeError, ValueError, AttributeError):
         return None
 
 
@@ -52,22 +55,45 @@ def _raise_provider_error(exc: Exception, action: str) -> None:
     raise AppError("AI_UNAVAILABLE", f"Could not reach the Google API while {action}. Check network and retry.", 503) from exc
 
 
+def _is_retryable(exc: Exception) -> bool:
+    code = _code_of(exc)
+    if code is not None and code in (500, 502, 503, 504):
+        return True
+    name = type(exc).__name__.lower()
+    return "servererror" in name or "timeout" in name
+
+
 def generate_text(prompt: str, temperature: float = 0.2) -> str:
     from google.genai import types
 
     client = _client()
-    try:
-        resp = client.models.generate_content(
-            model=settings.gemma_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=temperature),
-        )
-    except Exception as e:
-        _raise_provider_error(e, "generating text")
-    text = (resp.text or "").strip()
-    if not text:
-        raise AppError("AI_OUTPUT_INVALID", "The AI returned an empty response. Retry.", 502)
-    return text
+    max_retries = max(0, getattr(settings, "ai_max_retries", 1))
+    attempts = 1 + max_retries
+    last_exc = None
+
+    for attempt in range(attempts):
+        try:
+            resp = client.models.generate_content(
+                model=settings.gemma_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=temperature),
+            )
+            text = (resp.text or "").strip()
+            if not text:
+                raise AppError("AI_OUTPUT_INVALID", "The AI returned an empty response. Retry.", 502)
+            return text
+        except AppError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts - 1 and _is_retryable(e):
+                time.sleep(1)
+                continue
+            _raise_provider_error(e, "generating text")
+
+    if last_exc is not None:
+        _raise_provider_error(last_exc, "generating text")
+    raise AppError("AI_OUTPUT_INVALID", "The AI returned an empty response. Retry.", 502)
 
 
 def embed_texts(texts: list) -> list:
