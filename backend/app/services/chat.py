@@ -66,7 +66,8 @@ def ask(query: str, document_ids=None, session_id=None) -> dict:
     t0 = time.perf_counter()
     qvec = ai.embed([query.strip()])[0]
     t1 = time.perf_counter()
-    hits = vector.query(qvec, settings.rag_top_k, scope or None)
+    effective_scope = scope if scope else [d["id"] for d in ready]
+    hits = vector.query(qvec, settings.rag_top_k, effective_scope)
     t2 = time.perf_counter()
     hits = [h for h in hits if h["score"] >= settings.rag_min_score]
     if not hits:
